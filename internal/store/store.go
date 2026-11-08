@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -225,6 +226,7 @@ func New(dbPath string) (*Store, error) {
 
 	s := &Store{db: db}
 	if err := s.createTables(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %w", err)
 	}
 
@@ -485,7 +487,8 @@ func (s *Store) createTables() error {
 			credits_balance REAL,
 			reset_credits_count INTEGER,
 			raw_json TEXT,
-			quota_count INTEGER DEFAULT 0
+			quota_count INTEGER DEFAULT 0,
+			captured_at_instant TEXT
 		);
 
 		-- Banked Codex reset credits per account (issue #152). A credit that
@@ -541,7 +544,9 @@ func (s *Store) createTables() error {
 			cycle_end TEXT,
 			resets_at TEXT,
 			peak_utilization REAL NOT NULL DEFAULT 0,
-			total_delta REAL NOT NULL DEFAULT 0
+			total_delta REAL NOT NULL DEFAULT 0,
+			cycle_start_instant TEXT,
+			cycle_end_instant TEXT
 		);
 
 		-- Codex indexes
@@ -857,7 +862,8 @@ func (s *Store) createTables() error {
 			raw_json TEXT NOT NULL DEFAULT '',
 			account_type TEXT NOT NULL DEFAULT '',
 			plan_name TEXT NOT NULL DEFAULT '',
-			quota_count INTEGER NOT NULL DEFAULT 0
+			quota_count INTEGER NOT NULL DEFAULT 0,
+			captured_at_instant TEXT
 		);
 
 		CREATE TABLE IF NOT EXISTS opencode_quota_values (
@@ -880,7 +886,9 @@ func (s *Store) createTables() error {
 			cycle_end TEXT,
 			resets_at TEXT,
 			peak_utilization REAL NOT NULL DEFAULT 0,
-			total_delta REAL NOT NULL DEFAULT 0
+			total_delta REAL NOT NULL DEFAULT 0,
+			cycle_start_instant TEXT,
+			cycle_end_instant TEXT
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_opencode_snapshots_captured ON opencode_snapshots(captured_at);
@@ -1000,7 +1008,8 @@ func (s *Store) createTables() error {
 			period_cost REAL NOT NULL DEFAULT 0,
 			period_requests INTEGER NOT NULL DEFAULT 0,
 			period_tokens INTEGER NOT NULL DEFAULT 0,
-			quota_count INTEGER NOT NULL DEFAULT 0
+			quota_count INTEGER NOT NULL DEFAULT 0,
+			captured_at_instant TEXT
 		);
 
 		CREATE TABLE IF NOT EXISTS commandcode_quota_values (
@@ -1023,7 +1032,9 @@ func (s *Store) createTables() error {
 			cycle_end TEXT,
 			resets_at TEXT,
 			peak_utilization REAL NOT NULL DEFAULT 0,
-			total_delta REAL NOT NULL DEFAULT 0
+			total_delta REAL NOT NULL DEFAULT 0,
+			cycle_start_instant TEXT,
+			cycle_end_instant TEXT
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_commandcode_snapshots_captured ON commandcode_snapshots(captured_at);
@@ -1038,7 +1049,8 @@ func (s *Store) createTables() error {
 			id INTEGER PRIMARY KEY,
 			identity TEXT NOT NULL,
 			captured_at TEXT NOT NULL,
-			status TEXT NOT NULL
+			status TEXT NOT NULL,
+			captured_at_instant TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_mistral_snapshots ON mistral_snapshots(identity, captured_at);
 
@@ -1078,7 +1090,11 @@ func (s *Store) createTables() error {
 			delta REAL NOT NULL,
 			last_used REAL NOT NULL,
 			last_limit REAL NOT NULL,
-			last_at TEXT NOT NULL
+			last_at TEXT NOT NULL,
+			cycle_start_instant TEXT,
+			cycle_end_instant TEXT,
+			resets_at_instant TEXT,
+			last_at_instant TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_mistral_cycles ON mistral_cycles(identity, quota_name, cycle_start);
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_mistral_active_cycle ON mistral_cycles(identity, quota_name) WHERE cycle_end IS NULL;
@@ -1126,6 +1142,9 @@ func (s *Store) createTables() error {
 	// Run migrations for existing databases
 	if err := s.migrateSchema(); err != nil {
 		return fmt.Errorf("failed to migrate schema: %w", err)
+	}
+	if err := s.migrateInstantKeys(context.Background()); err != nil {
+		return fmt.Errorf("failed to migrate timestamps: %w", err)
 	}
 
 	return nil

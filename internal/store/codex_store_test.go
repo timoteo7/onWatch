@@ -282,6 +282,56 @@ func TestCodexStore_QueryCodexCycleOverview_UsesAccountScopedSnapshots(t *testin
 	}
 }
 
+func TestCodexStore_QueryLatestMixedValidity(t *testing.T) {
+	t.Run("malformed below valid", func(t *testing.T) {
+		s, err := New(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		legacyExec(t, s, `INSERT INTO codex_snapshots(account_id,captured_at) VALUES(1,'!')`)
+		first := time.Date(2026, 6, 10, 12, 0, 0, 1, time.UTC)
+		for _, at := range []time.Time{first, first.Add(time.Second)} {
+			id, err := s.InsertCodexSnapshot(&api.CodexSnapshot{AccountID: 1, CapturedAt: at})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.QueryLatestCodex(1)
+			if err != nil || got == nil || got.ID != id || !got.CapturedAt.Equal(at) {
+				t.Fatalf("latest = %+v, err=%v; want id %d at %s", got, err, id, at)
+			}
+		}
+	})
+	t.Run("malformed above valid", func(t *testing.T) {
+		s, err := New(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		legacyExec(t, s, `INSERT INTO codex_snapshots(account_id,captured_at) VALUES(1,'z')`)
+		if _, err := s.InsertCodexSnapshot(&api.CodexSnapshot{AccountID: 1, CapturedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.QueryLatestCodex(1)
+		if got != nil || err == nil || !strings.Contains(err.Error(), "codex snapshot captured_at") {
+			t.Fatalf("latest = %+v, err=%v; want captured_at parse error", got, err)
+		}
+	})
+	t.Run("valid mixed offsets", func(t *testing.T) {
+		s, err := New(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		legacyExec(t, s, `INSERT INTO codex_snapshots(account_id,captured_at) VALUES(1,'2026-01-02T05:00:00+01:00')`)
+		id := legacyExec(t, s, `INSERT INTO codex_snapshots(account_id,captured_at) VALUES(1,'2026-01-02T02:00:00-03:00')`)
+		got, err := s.QueryLatestCodex(1)
+		if err != nil || got == nil || got.ID != id || !got.CapturedAt.Equal(legacyTime(t, "2026-01-02T05:00:00Z")) {
+			t.Fatalf("latest = %+v, err=%v; want newer mixed-offset instant", got, err)
+		}
+	})
+}
+
 func TestCodexStore_QueryLatestCodex_ParseFailure(t *testing.T) {
 	t.Parallel()
 	s, err := New(":memory:")
