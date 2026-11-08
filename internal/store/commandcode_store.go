@@ -161,7 +161,7 @@ func (s *Store) QueryLatestCommandCode() (*api.CommandCodeSnapshot, error) {
 		`SELECT id, captured_at, account_name, account_id, org_id, plan, status,
 		        monthly_credits, purchased_credits, free_credits, remaining_credits,
 		        period_start, period_end, period_cost, period_requests, period_tokens
-		FROM commandcode_snapshots ORDER BY captured_at DESC LIMIT 1`,
+		FROM commandcode_snapshots WHERE captured_at_instant IS NOT NULL ORDER BY captured_at_instant DESC, id DESC LIMIT 1`,
 	).Scan(
 		&snapshot.ID, &capturedAt, &snapshot.AccountName, &snapshot.AccountID, &snapshot.OrgID,
 		&snapshot.Plan, &snapshot.Status,
@@ -196,16 +196,16 @@ func (s *Store) QueryCommandCodeRange(start, end time.Time, limit ...int) ([]*ap
 		period_start, period_end, period_cost, period_requests, period_tokens`
 
 	query := `SELECT ` + columns + ` FROM commandcode_snapshots
-		WHERE captured_at BETWEEN ? AND ? ORDER BY captured_at ASC`
-	args := []interface{}{start.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano)}
+		WHERE captured_at_instant BETWEEN ? AND ? ORDER BY captured_at_instant ASC, id ASC`
+	args := []interface{}{instantKey(start), instantKey(end)}
 	if len(limit) > 0 && limit[0] > 0 {
 		query = `SELECT ` + columns + ` FROM (
-				SELECT ` + columns + ` FROM commandcode_snapshots
-				WHERE captured_at BETWEEN ? AND ?
-				ORDER BY captured_at DESC
+				SELECT ` + columns + `, captured_at_instant FROM commandcode_snapshots
+				WHERE captured_at_instant BETWEEN ? AND ?
+				ORDER BY captured_at_instant DESC, id DESC
 				LIMIT ?
 			) recent
-			ORDER BY captured_at ASC`
+			ORDER BY captured_at_instant ASC, id ASC`
 		args = append(args, limit[0])
 	}
 
@@ -214,8 +214,8 @@ func (s *Store) QueryCommandCodeRange(start, end time.Time, limit ...int) ([]*ap
 
 // QueryCommandCodeChartRange samples the entire range with at most 200 snapshots.
 func (s *Store) QueryCommandCodeChartRange(start, end time.Time) ([]*api.CommandCodeSnapshot, error) {
-	query := windowChartQuery("commandcode_snapshots", "id, captured_at, account_name, account_id, org_id, plan, status, monthly_credits, purchased_credits, free_credits, remaining_credits, period_start, period_end, period_cost, period_requests, period_tokens")
-	return s.queryCommandCodeSnapshots(query, []interface{}{start.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano)})
+	query := instantWindowChartQueryWhere("commandcode_snapshots", "id, captured_at, account_name, account_id, org_id, plan, status, monthly_credits, purchased_credits, free_credits, remaining_credits, period_start, period_end, period_cost, period_requests, period_tokens", "")
+	return s.queryCommandCodeSnapshots(query, []interface{}{instantKey(start), instantKey(end)})
 }
 
 func (s *Store) queryCommandCodeSnapshots(query string, args []interface{}) ([]*api.CommandCodeSnapshot, error) {
@@ -420,7 +420,7 @@ func (s *Store) QueryActiveCommandCodeCycle(quotaName string) (*CommandCodeReset
 // QueryCommandCodeCycleHistory returns closed cycles, newest first.
 func (s *Store) QueryCommandCodeCycleHistory(quotaName string, limit ...int) ([]*CommandCodeResetCycle, error) {
 	query := `SELECT id, quota_name, cycle_start, cycle_end, resets_at, peak_utilization, total_delta
-		FROM commandcode_reset_cycles WHERE quota_name = ? AND cycle_end IS NOT NULL ORDER BY cycle_start DESC`
+		FROM commandcode_reset_cycles WHERE quota_name = ? AND cycle_end IS NOT NULL ORDER BY cycle_start_instant DESC, id DESC`
 	args := []interface{}{quotaName}
 	if len(limit) > 0 && limit[0] > 0 {
 		query += ` LIMIT ?`
@@ -451,9 +451,9 @@ func (s *Store) QueryCommandCodeUtilizationSeries(quotaName string, since time.T
 		`SELECT s.captured_at, qv.utilization
 		FROM commandcode_quota_values qv
 		JOIN commandcode_snapshots s ON s.id = qv.snapshot_id
-		WHERE qv.quota_name = ? AND s.captured_at >= ?
-		ORDER BY s.captured_at ASC`,
-		quotaName, since.UTC().Format(time.RFC3339Nano),
+		WHERE qv.quota_name = ? AND s.captured_at_instant >= ?
+		ORDER BY s.captured_at_instant ASC, s.id ASC`,
+		quotaName, instantKey(since),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query commandcode utilization series: %w", err)
@@ -482,7 +482,7 @@ func (s *Store) QueryCommandCodeLatestPerQuota() ([]CommandCodeLatestQuota, erro
 		       qv.remaining, s.captured_at, s.plan, s.account_name
 		FROM commandcode_quota_values qv
 		JOIN commandcode_snapshots s ON s.id = qv.snapshot_id
-		WHERE s.id = (SELECT MAX(id) FROM commandcode_snapshots)
+		WHERE s.id = (SELECT id FROM commandcode_snapshots WHERE captured_at_instant IS NOT NULL ORDER BY captured_at_instant DESC, id DESC LIMIT 1)
 		ORDER BY qv.quota_name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query latest commandcode per-quota: %w", err)
@@ -588,11 +588,11 @@ func (s *Store) QueryCommandCodeCycleOverview(groupBy string, limit int) ([]Cycl
 		err := s.db.QueryRow(
 			`SELECT s.id, s.captured_at FROM commandcode_snapshots s
 			JOIN commandcode_quota_values qv ON qv.snapshot_id = s.id
-			WHERE qv.quota_name = ? AND s.captured_at >= ? AND s.captured_at < ?
+			WHERE qv.quota_name = ? AND s.captured_at_instant >= ? AND s.captured_at_instant < ?
 			ORDER BY qv.utilization DESC LIMIT 1`,
 			groupBy,
-			c.CycleStart.Format(time.RFC3339Nano),
-			endBoundary.Format(time.RFC3339Nano),
+			instantKey(c.CycleStart),
+			instantKey(endBoundary),
 		).Scan(&snapshotID, &capturedAt)
 
 		if err == sql.ErrNoRows {

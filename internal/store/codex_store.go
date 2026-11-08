@@ -112,9 +112,14 @@ func (s *Store) QueryLatestCodex(accountID int64) (*api.CodexSnapshot, error) {
 	var creditsBalance sql.NullFloat64
 	var resetCreditsCount, applicableCreditsCount sql.NullInt64
 
+	// Preserve the old parse error only when raw ordering would select a malformed row.
 	err := s.db.QueryRow(
-		`SELECT id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id FROM codex_snapshots WHERE account_id = ? ORDER BY captured_at DESC LIMIT 1`,
-		accountID,
+		`SELECT id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id FROM codex_snapshots
+		WHERE id = COALESCE(
+			(SELECT id FROM codex_snapshots WHERE id = (SELECT id FROM codex_snapshots WHERE account_id = ? ORDER BY captured_at DESC LIMIT 1) AND captured_at_instant IS NULL),
+			(SELECT id FROM codex_snapshots WHERE account_id = ? AND captured_at_instant IS NOT NULL ORDER BY captured_at_instant DESC, id DESC LIMIT 1)
+		)`,
+		accountID, accountID,
 	).Scan(&snapshot.ID, &capturedAt, &planType, &creditsBalance, &resetCreditsCount, &applicableCreditsCount, new(int), &snapshot.AccountID)
 
 	if err == sql.ErrNoRows {
@@ -180,18 +185,18 @@ func (s *Store) QueryCodexRange(accountID int64, start, end time.Time, limit ...
 		accountID = DefaultCodexAccountID
 	}
 	query := `SELECT id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id FROM codex_snapshots
-		WHERE account_id = ? AND captured_at BETWEEN ? AND ? ORDER BY captured_at ASC`
-	args := []interface{}{accountID, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)}
+		WHERE account_id = ? AND captured_at_instant BETWEEN ? AND ? ORDER BY captured_at_instant ASC, id ASC`
+	args := []interface{}{accountID, instantKey(start), instantKey(end)}
 	if len(limit) > 0 && limit[0] > 0 {
 		query = `SELECT id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id
 			FROM (
-				SELECT id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id
+				SELECT id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id, captured_at_instant
 				FROM codex_snapshots
-				WHERE account_id = ? AND captured_at BETWEEN ? AND ?
-				ORDER BY captured_at DESC
+				WHERE account_id = ? AND captured_at_instant BETWEEN ? AND ?
+				ORDER BY captured_at_instant DESC, id DESC
 				LIMIT ?
 			) recent
-			ORDER BY captured_at ASC`
+			ORDER BY captured_at_instant ASC, id ASC`
 		args = append(args, limit[0])
 	}
 
@@ -216,9 +221,9 @@ func (s *Store) QueryCodexRangeSampled(accountID int64, start, end time.Time) ([
 		accountID = DefaultCodexAccountID
 	}
 	// Filter and sample the account's rows in one query.
-	query := windowChartQueryWhere("codex_snapshots", "id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id", "account_id = ?")
+	query := instantWindowChartQueryWhere("codex_snapshots", "id, captured_at, plan_type, credits_balance, reset_credits_count, applicable_credits_count, quota_count, account_id", "account_id = ?")
 	rows, err := s.db.Query(query,
-		start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano), accountID)
+		instantKey(start), instantKey(end), accountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query sampled codex range: %w", err)
 	}
@@ -459,7 +464,7 @@ func (s *Store) QueryCodexCycleHistory(accountID int64, quotaName string, limit 
 		accountID = DefaultCodexAccountID
 	}
 	query := `SELECT id, account_id, quota_name, cycle_start, cycle_end, resets_at, peak_utilization, total_delta
-		FROM codex_reset_cycles WHERE account_id = ? AND quota_name = ? AND cycle_end IS NOT NULL ORDER BY cycle_start DESC`
+		FROM codex_reset_cycles WHERE account_id = ? AND quota_name = ? AND cycle_end IS NOT NULL ORDER BY cycle_start_instant DESC, id DESC`
 	args := []interface{}{accountID, quotaName}
 	if len(limit) > 0 && limit[0] > 0 {
 		query += ` LIMIT ?`
@@ -523,11 +528,11 @@ func (s *Store) QueryCodexCyclesSince(accountID int64, quotaName string, since t
 	}
 	rows, err := s.db.Query(
 		`SELECT id, account_id, quota_name, cycle_start, cycle_end, resets_at, peak_utilization, total_delta
-		FROM codex_reset_cycles WHERE account_id = ? AND quota_name = ? AND cycle_end IS NOT NULL AND cycle_start >= ?
-		ORDER BY cycle_start DESC`,
+		FROM codex_reset_cycles WHERE account_id = ? AND quota_name = ? AND cycle_end IS NOT NULL AND (cycle_start_instant >= ? OR cycle_start_instant IS NULL)
+		ORDER BY cycle_start_instant DESC, id DESC`,
 		accountID,
 		quotaName,
-		since.UTC().Format(time.RFC3339Nano),
+		instantKey(since),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query codex cycles since: %w", err)
@@ -587,11 +592,11 @@ func (s *Store) QueryCodexUtilizationSeries(accountID int64, quotaName string, s
 		`SELECT s.captured_at, qv.utilization
 		FROM codex_quota_values qv
 		JOIN codex_snapshots s ON s.id = qv.snapshot_id
-		WHERE s.account_id = ? AND qv.quota_name = ? AND s.captured_at >= ?
-		ORDER BY s.captured_at ASC`,
+		WHERE s.account_id = ? AND qv.quota_name = ? AND s.captured_at_instant >= ?
+		ORDER BY s.captured_at_instant ASC, s.id ASC`,
 		accountID,
 		quotaName,
-		since.UTC().Format(time.RFC3339Nano),
+		instantKey(since),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query codex utilization series: %w", err)
@@ -671,12 +676,12 @@ func (s *Store) QueryCodexCycleOverview(accountID int64, groupBy string, limit i
 		err := s.db.QueryRow(
 			`SELECT s.id, s.captured_at FROM codex_snapshots s
 			JOIN codex_quota_values qv ON qv.snapshot_id = s.id
-			WHERE s.account_id = ? AND qv.quota_name = ? AND s.captured_at >= ? AND s.captured_at < ?
+			WHERE s.account_id = ? AND qv.quota_name = ? AND s.captured_at_instant >= ? AND s.captured_at_instant < ?
 			ORDER BY qv.utilization DESC LIMIT 1`,
 			accountID,
 			groupBy,
-			c.CycleStart.Format(time.RFC3339Nano),
-			endBoundary.Format(time.RFC3339Nano),
+			instantKey(c.CycleStart),
+			instantKey(endBoundary),
 		).Scan(&snapshotID, &capturedAt)
 
 		if err == sql.ErrNoRows {
@@ -699,11 +704,11 @@ func (s *Store) QueryCodexCycleOverview(accountID int64, groupBy string, limit i
 		var firstSnapshotID int64
 		err = s.db.QueryRow(
 			`SELECT id FROM codex_snapshots
-			WHERE account_id = ? AND captured_at >= ? AND captured_at < ?
-			ORDER BY captured_at ASC LIMIT 1`,
+			WHERE account_id = ? AND captured_at_instant >= ? AND captured_at_instant < ?
+			ORDER BY captured_at_instant ASC, id ASC LIMIT 1`,
 			accountID,
-			c.CycleStart.Format(time.RFC3339Nano),
-			endBoundary.Format(time.RFC3339Nano),
+			instantKey(c.CycleStart),
+			instantKey(endBoundary),
 		).Scan(&firstSnapshotID)
 		if err == nil {
 			firstIDs = append(firstIDs, firstSnapshotID)

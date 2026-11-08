@@ -13,16 +13,15 @@ const mistralActiveIdentity = `(SELECT value FROM settings WHERE key='mistral_id
 
 // Hot-path reads. LatestMistral runs on every dashboard refresh, menubar
 // refresh and metrics scrape, so each statement is ordered to let SQLite walk
-// an index backwards and stop at the first row. idx_mistral_snapshots is
-// (identity, captured_at) and carries the rowid, so ordering by captured_at
+// an index backwards and stop at the first row. The instant index is
+// (identity, captured_at_instant) and carries the rowid, so ordering by instant
 // then id matches it; ordering by id alone forced a sort of every snapshot the
 // identity had - about 28ms a call at 90 days, growing with retention.
 const (
-	mistralLatestSnapshotSQL = `SELECT id,identity,captured_at,status FROM mistral_snapshots WHERE identity=` + mistralActiveIdentity + ` ORDER BY captured_at DESC, id DESC LIMIT 1`
-	// Driven from the billing table, which only has rows when pay-as-you-go
-	// data exists, instead of from every snapshot of the identity.
-	mistralLatestBillingSQL = `SELECT b.amount,b.currency,b.period_start,b.period_end,b.captured_at,b.status FROM mistral_billing b WHERE (SELECT identity FROM mistral_snapshots WHERE id=b.snapshot_id)=? ORDER BY b.snapshot_id DESC LIMIT 1`
-	mistralHistoryWindowSQL = `SELECT id,identity,captured_at,status FROM mistral_snapshots WHERE identity=` + mistralActiveIdentity + ` AND captured_at BETWEEN ? AND ? ORDER BY captured_at DESC, id DESC LIMIT ?`
+	mistralLatestSnapshotSQL = `SELECT id,identity,captured_at,status FROM mistral_snapshots WHERE identity=` + mistralActiveIdentity + ` AND captured_at_instant IS NOT NULL ORDER BY captured_at_instant DESC, id DESC LIMIT 1`
+	// Walk the identity's instant index and stop at the newest billed snapshot.
+	mistralLatestBillingSQL = `SELECT b.amount,b.currency,b.period_start,b.period_end,b.captured_at,b.status FROM mistral_snapshots s JOIN mistral_billing b ON b.snapshot_id=s.id WHERE s.identity=? AND s.captured_at_instant IS NOT NULL ORDER BY s.captured_at_instant DESC,s.id DESC LIMIT 1`
+	mistralHistoryWindowSQL = `SELECT id,identity,captured_at,status,captured_at_instant FROM mistral_snapshots WHERE identity=` + mistralActiveIdentity + ` AND captured_at_instant BETWEEN ? AND ? ORDER BY captured_at_instant DESC, id DESC LIMIT ?`
 )
 
 // mistralQuotaFromRow rebuilds a quota from its typed columns. NULL amounts mean
@@ -105,7 +104,7 @@ func (s *Store) LatestMistral(ctx context.Context) (*api.MistralSnapshot, error)
 	// Each quota comes from the newest snapshot that carried it, which may not
 	// be the newest snapshot overall, so capturedAt is taken per quota rather
 	// than inherited from the parent - the dashboard's staleness check needs it.
-	rows, e := s.db.QueryContext(ctx, `SELECT q.quota_name,q.used,q.limit_value,q.utilization,q.currency,q.resets_at,qs.captured_at FROM (SELECT 'api_included' AS name UNION ALL SELECT 'vibe_included') keys JOIN mistral_quota_values q ON q.quota_name=keys.name AND q.snapshot_id=(SELECT MAX(q2.snapshot_id) FROM mistral_quota_values q2 JOIN mistral_snapshots s ON s.id=q2.snapshot_id WHERE s.identity=? AND q2.quota_name=keys.name) JOIN mistral_snapshots qs ON qs.id=q.snapshot_id ORDER BY q.quota_name`, snap.Identity)
+	rows, e := s.db.QueryContext(ctx, `SELECT q.quota_name,q.used,q.limit_value,q.utilization,q.currency,q.resets_at,qs.captured_at FROM (SELECT 'api_included' AS name UNION ALL SELECT 'vibe_included') keys JOIN mistral_quota_values q ON q.quota_name=keys.name AND q.snapshot_id=(SELECT q2.snapshot_id FROM mistral_quota_values q2 JOIN mistral_snapshots s ON s.id=q2.snapshot_id WHERE s.identity=? AND q2.quota_name=keys.name AND s.captured_at_instant IS NOT NULL ORDER BY s.captured_at_instant DESC,s.id DESC LIMIT 1) JOIN mistral_snapshots qs ON qs.id=q.snapshot_id ORDER BY q.quota_name`, snap.Identity)
 	if e != nil {
 		return nil, e
 	}
@@ -147,8 +146,8 @@ func (s *Store) MistralHistory(ctx context.Context, start, end time.Time, limit 
 	// The limit bounds snapshots, not joined rows, so apply it in a subquery
 	// before joining. The identity filter has to stay inside it too, or it no
 	// longer bounds what LIMIT sees.
-	rows, e := s.db.QueryContext(ctx, `SELECT r.id,r.identity,r.captured_at,r.status,q.quota_name,q.used,q.limit_value,q.utilization,q.currency,q.resets_at,b.amount,b.currency,b.period_start,b.period_end,b.captured_at,b.status FROM (`+mistralHistoryWindowSQL+`) r LEFT JOIN mistral_quota_values q ON q.snapshot_id=r.id LEFT JOIN mistral_billing b ON b.snapshot_id=r.id ORDER BY r.id, q.quota_name`,
-		start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano), max(1, min(limit, 200)))
+	rows, e := s.db.QueryContext(ctx, `SELECT r.id,r.identity,r.captured_at,r.status,q.quota_name,q.used,q.limit_value,q.utilization,q.currency,q.resets_at,b.amount,b.currency,b.period_start,b.period_end,b.captured_at,b.status FROM (`+mistralHistoryWindowSQL+`) r LEFT JOIN mistral_quota_values q ON q.snapshot_id=r.id LEFT JOIN mistral_billing b ON b.snapshot_id=r.id ORDER BY r.captured_at_instant, r.id, q.quota_name`,
+		instantKey(start), instantKey(end), max(1, min(limit, 200)))
 	if e != nil {
 		return nil, e
 	}
@@ -251,7 +250,7 @@ func (s *Store) TrackMistral(ctx context.Context, identity string, q api.Mistral
 	return didReset, tx.Commit()
 }
 func (s *Store) MistralCycles(ctx context.Context, name string, limit int) ([]MistralCycle, error) {
-	rows, e := s.db.QueryContext(ctx, `SELECT id,quota_name,cycle_start,cycle_end,resets_at,peak,delta FROM mistral_cycles WHERE identity=`+mistralActiveIdentity+` AND quota_name=? ORDER BY id DESC LIMIT ?`, name, max(1, min(limit, 200)))
+	rows, e := s.db.QueryContext(ctx, `SELECT id,quota_name,cycle_start,cycle_end,resets_at,peak,delta FROM mistral_cycles WHERE identity=`+mistralActiveIdentity+` AND quota_name=? AND cycle_start_instant IS NOT NULL ORDER BY cycle_start_instant DESC, id DESC LIMIT ?`, name, max(1, min(limit, 200)))
 	if e != nil {
 		return nil, e
 	}
@@ -296,7 +295,7 @@ func (s *Store) PruneMistral(ctx context.Context, before time.Time) error {
 	for i, stmt := range []string{
 		`DROP TABLE IF EXISTS temp.mistral_prune`,
 		// Preserve latest values per source for reconnect, even beyond retention.
-		`CREATE TEMP TABLE mistral_prune AS SELECT id FROM mistral_snapshots WHERE captured_at<? AND id NOT IN (SELECT MAX(id) FROM mistral_snapshots GROUP BY identity) AND id NOT IN (SELECT MAX(q.snapshot_id) FROM mistral_quota_values q JOIN mistral_snapshots s ON s.id=q.snapshot_id GROUP BY s.identity,q.quota_name) AND id NOT IN (SELECT MAX(b.snapshot_id) FROM mistral_billing b JOIN mistral_snapshots s ON s.id=b.snapshot_id GROUP BY s.identity)`,
+		`CREATE TEMP TABLE mistral_prune AS SELECT id FROM mistral_snapshots WHERE captured_at_instant<? AND id NOT IN (SELECT id FROM (SELECT id,ROW_NUMBER() OVER (PARTITION BY identity ORDER BY captured_at_instant DESC,id DESC) AS rn FROM mistral_snapshots WHERE captured_at_instant IS NOT NULL) WHERE rn=1) AND id NOT IN (SELECT id FROM (SELECT s.id,ROW_NUMBER() OVER (PARTITION BY s.identity,q.quota_name ORDER BY s.captured_at_instant DESC,s.id DESC) AS rn FROM mistral_quota_values q JOIN mistral_snapshots s ON s.id=q.snapshot_id WHERE s.captured_at_instant IS NOT NULL) WHERE rn=1) AND id NOT IN (SELECT id FROM (SELECT s.id,ROW_NUMBER() OVER (PARTITION BY s.identity ORDER BY s.captured_at_instant DESC,s.id DESC) AS rn FROM mistral_billing b JOIN mistral_snapshots s ON s.id=b.snapshot_id WHERE s.captured_at_instant IS NOT NULL) WHERE rn=1)`,
 		`DELETE FROM mistral_quota_values WHERE snapshot_id IN (SELECT id FROM temp.mistral_prune)`,
 		`DELETE FROM mistral_billing WHERE snapshot_id IN (SELECT id FROM temp.mistral_prune)`,
 		`DELETE FROM mistral_snapshots WHERE id IN (SELECT id FROM temp.mistral_prune)`,
@@ -304,13 +303,13 @@ func (s *Store) PruneMistral(ctx context.Context, before time.Time) error {
 	} {
 		var args []any
 		if i == 1 {
-			args = []any{before.Format(time.RFC3339Nano)}
+			args = []any{instantKey(before)}
 		}
 		if _, e = tx.ExecContext(ctx, stmt, args...); e != nil {
 			return e
 		}
 	}
-	_, e = tx.ExecContext(ctx, `DELETE FROM mistral_cycles WHERE cycle_end IS NOT NULL AND cycle_end<?`, before.Format(time.RFC3339Nano))
+	_, e = tx.ExecContext(ctx, `DELETE FROM mistral_cycles WHERE cycle_start_instant IS NOT NULL AND last_at_instant IS NOT NULL AND (resets_at IS NULL OR resets_at_instant IS NOT NULL) AND cycle_end_instant<?`, instantKey(before))
 	if e != nil {
 		return e
 	}
@@ -331,7 +330,7 @@ func (s *Store) MistralCycleOverview(ctx context.Context, name string) ([]CycleO
 		}
 		var id int64
 		var at string
-		e = s.db.QueryRowContext(ctx, `SELECT s.id,s.captured_at FROM mistral_snapshots s JOIN mistral_quota_values q ON q.snapshot_id=s.id WHERE s.identity=`+mistralActiveIdentity+` AND q.quota_name=? AND s.captured_at>=? AND s.captured_at<? ORDER BY q.utilization DESC LIMIT 1`, name, c.CycleStart.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)).Scan(&id, &at)
+		e = s.db.QueryRowContext(ctx, `SELECT s.id,s.captured_at FROM mistral_snapshots s JOIN mistral_quota_values q ON q.snapshot_id=s.id WHERE s.identity=`+mistralActiveIdentity+` AND q.quota_name=? AND s.captured_at_instant>=? AND s.captured_at_instant<? ORDER BY q.utilization DESC LIMIT 1`, name, instantKey(c.CycleStart), instantKey(end)).Scan(&id, &at)
 		if e == sql.ErrNoRows {
 			result = append(result, row)
 			continue
